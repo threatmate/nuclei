@@ -9,6 +9,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 
@@ -25,17 +26,34 @@ import (
 // fourth were closed on return and the next request dialled again, so the
 // target saw close to one TCP connection per HTTP request.
 //
-// The server here counts accepted connections, which is what actually matters:
-// connection churn is invisible in request counts but is what exhausts NAT
-// port mappings and pays a TCP (and TLS) handshake per request.
+// The server counts accepted connections, which is what actually matters:
+// connection churn is invisible in request counts but is what pays a TCP (and
+// TLS) handshake per request and exhausts NAT port mappings.
 func TestIdleConnPoolAllowsKeepAliveReuse(t *testing.T) {
 	const (
 		requests    = 400
 		concurrency = 50
 	)
 
-	var accepted atomic.Int64
+	var accepted, arrived atomic.Int64
+
+	// Hold the first `concurrency` requests inside the handler until all of
+	// them have arrived, so the transport is genuinely forced to keep that
+	// many connections open at once. Without this the requests could
+	// serialise and the connection count would prove nothing.
+	barrier := make(chan struct{})
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(barrier) }) }
+	// Safety valve: never hang the suite if fewer than `concurrency` requests
+	// ever reach the handler.
+	timer := time.AfterFunc(30*time.Second, release)
+	defer timer.Stop()
+
 	server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if arrived.Add(1) >= concurrency {
+			release()
+		}
+		<-barrier
 		_, _ = w.Write([]byte("ok"))
 	}))
 	server.Config.ConnState = func(_ net.Conn, state http.ConnState) {
@@ -52,6 +70,10 @@ func TestIdleConnPoolAllowsKeepAliveReuse(t *testing.T) {
 	client, err := Get(opts, &Configuration{}, server.Listener.Addr().String())
 	require.NoError(t, err)
 
+	var succeeded atomic.Int64
+	var errMu sync.Mutex
+	var firstErr error
+
 	sem := make(chan struct{}, concurrency)
 	var wg sync.WaitGroup
 	for i := 0; i < requests; i++ {
@@ -61,28 +83,272 @@ func TestIdleConnPoolAllowsKeepAliveReuse(t *testing.T) {
 			defer wg.Done()
 			defer func() { <-sem }()
 
+			recordErr := func(err error) {
+				errMu.Lock()
+				defer errMu.Unlock()
+				if firstErr == nil {
+					firstErr = err
+				}
+			}
+
 			req, err := retryablehttp.NewRequest(http.MethodGet, fmt.Sprintf("%s/path-%d", server.URL, i), nil)
 			if err != nil {
+				recordErr(err)
 				return
 			}
 			resp, err := client.Do(req)
 			if err != nil {
+				recordErr(err)
 				return
 			}
 			// Drain and close so the connection is eligible for reuse.
-			_, _ = io.Copy(io.Discard, resp.Body)
-			_ = resp.Body.Close()
+			if _, err := io.Copy(io.Discard, resp.Body); err != nil {
+				_ = resp.Body.Close()
+				recordErr(err)
+				return
+			}
+			if err := resp.Body.Close(); err != nil {
+				recordErr(err)
+				return
+			}
+			succeeded.Add(1)
 		}(i)
 	}
 	wg.Wait()
+
+	// Without these the connection assertion is vacuous: zero successful
+	// requests also means zero connections.
+	require.NoError(t, firstErr, "requests must succeed for the connection count to mean anything")
+	require.Equal(t, int64(requests), succeeded.Load(), "all requests must succeed")
+	require.GreaterOrEqual(t, arrived.Load(), int64(concurrency),
+		"handler must have seen at least `concurrency` requests for the overlap barrier to have engaged")
 
 	conns := accepted.Load()
 	t.Logf("%d requests over %d connections (%.1f requests/connection)",
 		requests, conns, float64(requests)/float64(conns))
 
-	// Steady state needs at most `concurrency` connections in flight. Allow
-	// generous headroom for scheduling jitter while still failing loudly on
-	// the ~1-connection-per-request regression, which would land near 400.
+	// `concurrency` connections are genuinely required by the barrier above.
+	// Anything much beyond that is the pool discarding connections instead of
+	// reusing them; the regression lands near one connection per request.
 	require.LessOrEqual(t, conns, int64(concurrency*2),
 		"connections should be bounded by concurrency, not by request count")
+}
+
+// TestIdleConnPoolSize covers the sizing rule itself: the pool follows -c, a
+// template's payload threads multiply into it, and nothing a template declares
+// can shrink it below -c.
+func TestIdleConnPoolSize(t *testing.T) {
+	for _, testCase := range []struct {
+		name            string
+		templateThreads int
+		requestThreads  int
+		want            int
+	}{
+		{name: "default -c when unset", templateThreads: 0, requestThreads: 0, want: 25},
+		{name: "default -c", templateThreads: 25, requestThreads: 0, want: 25},
+		{name: "-c 50", templateThreads: 50, requestThreads: 0, want: 50},
+		{name: "-c 800", templateThreads: 800, requestThreads: 0, want: 800},
+		// Payload threads are per template and templateThreads of those
+		// templates run at once against the same client, so they multiply.
+		{name: "payload threads raise the pool", templateThreads: 25, requestThreads: 10, want: 250},
+		{name: "payload threads raise the pool at -c 800", templateThreads: 800, requestThreads: 2, want: 1600},
+		// A single-threaded payload template must not drag the pool down to 1:
+		// the other templates running concurrently still need their share.
+		{name: "payload threads never shrink the pool", templateThreads: 50, requestThreads: 1, want: 50},
+		{name: "negative payload threads never shrink the pool", templateThreads: 50, requestThreads: -1, want: 50},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			got := idleConnPoolSize(testCase.templateThreads, testCase.requestThreads)
+			require.Equal(t, testCase.want, got)
+			require.GreaterOrEqual(t, got, min(testCase.templateThreads, defaultTemplateThreads),
+				"the pool must never fall below the template concurrency it has to serve")
+		})
+	}
+}
+
+// TestIdleConnPoolSizeIsWiredToTransport checks that the size actually reaches
+// the transport, not just the helper: a sizing rule that never lands on
+// http.Transport would leave the reuse bug in place while the unit test above
+// still passed.
+func TestIdleConnPoolSizeIsWiredToTransport(t *testing.T) {
+	opts := newTestOptions(t, "test-idle-conn-pool-wiring")
+	opts.TemplateThreads = 800
+
+	client, err := Get(opts, &Configuration{}, "example.com")
+	require.NoError(t, err)
+
+	tracking, ok := client.HTTPClient.Transport.(*connTrackingTransport)
+	require.True(t, ok, "expected the connection-tracking transport wrapper")
+	transport, ok := tracking.base.(*http.Transport)
+	require.True(t, ok, "expected an *http.Transport underneath")
+
+	require.Equal(t, 800, transport.MaxIdleConnsPerHost)
+	require.Equal(t, 800, transport.MaxIdleConns)
+}
+
+// cyclicBarrier releases waiters in groups of n. The single-shot barrier used
+// above only forces the FIRST group of requests to overlap; a pool that is too
+// small still looks fine afterwards, because once the requests stop overlapping
+// a shallow pool is enough. Holding every group keeps the concurrency up for
+// the whole run, which is what a scan actually does to a host.
+type cyclicBarrier struct {
+	mu        sync.Mutex
+	n         int
+	count     int
+	gate      chan struct{}
+	abandoned bool
+}
+
+func newCyclicBarrier(n int) *cyclicBarrier {
+	return &cyclicBarrier{n: n, gate: make(chan struct{})}
+}
+
+func (b *cyclicBarrier) wait() {
+	b.mu.Lock()
+	if b.abandoned {
+		b.mu.Unlock()
+		return
+	}
+	b.count++
+	gate := b.gate
+	if b.count == b.n {
+		b.count = 0
+		b.gate = make(chan struct{})
+		close(gate)
+		b.mu.Unlock()
+		return
+	}
+	b.mu.Unlock()
+	<-gate
+}
+
+// abandon is the safety valve: it stops blocking so a shortfall fails on the
+// assertions instead of hanging the suite.
+func (b *cyclicBarrier) abandon() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.abandoned {
+		return
+	}
+	b.abandoned = true
+	close(b.gate)
+}
+
+func (b *cyclicBarrier) wasAbandoned() bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.abandoned
+}
+
+// TestIdleConnPoolAllowsKeepAliveReuseWithPayloadThreads is the case the
+// per-template view misses. Templates that declare payload threads share one
+// client -- Configuration.Threads is part of the client cache key, and every
+// template with the same value hashes to the same entry -- so the requests in
+// flight against the host are templateThreads * payloadThreads. Sizing the pool
+// to the larger of the two instead of their product puts the transport back
+// below the concurrency it serves, and the reuse collapse returns.
+func TestIdleConnPoolAllowsKeepAliveReuseWithPayloadThreads(t *testing.T) {
+	const (
+		templateThreads   = 10
+		payloadThreads    = 5
+		concurrency       = templateThreads * payloadThreads
+		requestsPerWorker = 8
+		requests          = concurrency * requestsPerWorker
+	)
+
+	var accepted atomic.Int64
+	barrier := newCyclicBarrier(concurrency)
+	timer := time.AfterFunc(30*time.Second, barrier.abandon)
+	defer timer.Stop()
+
+	server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		barrier.wait()
+		_, _ = w.Write([]byte("ok"))
+	}))
+	server.Config.ConnState = func(_ net.Conn, state http.ConnState) {
+		if state == http.StateNew {
+			accepted.Add(1)
+		}
+	}
+	server.Start()
+	defer server.Close()
+
+	opts := newTestOptions(t, "test-idle-conn-pool-payload-threads")
+	opts.TemplateThreads = templateThreads
+
+	// One client, as the engine would hand out: every payload template with
+	// this thread count hashes to the same cache entry.
+	client, err := Get(opts, &Configuration{Threads: payloadThreads}, server.Listener.Addr().String())
+	require.NoError(t, err)
+
+	var succeeded atomic.Int64
+	var errMu sync.Mutex
+	var firstErr error
+	recordErr := func(err error) {
+		errMu.Lock()
+		defer errMu.Unlock()
+		if firstErr == nil {
+			firstErr = err
+		}
+	}
+
+	// templateThreads templates in flight, each running payloadThreads workers.
+	var wg sync.WaitGroup
+	for template := 0; template < templateThreads; template++ {
+		for worker := 0; worker < payloadThreads; worker++ {
+			wg.Add(1)
+			go func(template, worker int) {
+				defer wg.Done()
+
+				for i := 0; i < requestsPerWorker; i++ {
+					req, err := retryablehttp.NewRequest(http.MethodGet,
+						fmt.Sprintf("%s/t-%d/w-%d/%d", server.URL, template, worker, i), nil)
+					if err != nil {
+						recordErr(err)
+						barrier.abandon()
+						return
+					}
+					resp, err := client.Do(req)
+					if err != nil {
+						recordErr(err)
+						barrier.abandon()
+						return
+					}
+					if _, err := io.Copy(io.Discard, resp.Body); err != nil {
+						_ = resp.Body.Close()
+						recordErr(err)
+						barrier.abandon()
+						return
+					}
+					if err := resp.Body.Close(); err != nil {
+						recordErr(err)
+						barrier.abandon()
+						return
+					}
+					succeeded.Add(1)
+				}
+			}(template, worker)
+		}
+	}
+	wg.Wait()
+
+	// Without these the connection assertion is vacuous: zero successful
+	// requests also means zero connections.
+	require.NoError(t, firstErr, "requests must succeed for the connection count to mean anything")
+	require.Equal(t, int64(requests), succeeded.Load(), "all requests must succeed")
+	require.False(t, barrier.wasAbandoned(),
+		"the barrier must have held every group; the safety valve firing means the overlap was not sustained")
+
+	conns := accepted.Load()
+	t.Logf("%d requests over %d connections (%.1f requests/connection), pool=%d",
+		requests, conns, float64(requests)/float64(conns),
+		idleConnPoolSize(templateThreads, payloadThreads))
+
+	// concurrency connections are genuinely required. Sizing the pool to
+	// max(templateThreads, payloadThreads) instead of their product leaves it
+	// at 10 here, so connections past the tenth are closed on return and
+	// redialled: measured 123 connections (3.3 requests/connection) against 50
+	// (8.0) with the product.
+	require.LessOrEqual(t, conns, int64(concurrency*2),
+		"connections should be bounded by templateThreads*payloadThreads, not by request count")
 }

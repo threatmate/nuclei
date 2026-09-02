@@ -278,12 +278,40 @@ func GetRawHTTP(options *protocols.ExecutorOptions) *rawhttp.Client {
 	return dialers.RawHTTPClient
 }
 
-// defaultMaxIdleConnsPerHost is the per-host idle connection pool size. Clients
-// are scoped to a single host, so this has to cover the requests that can be in
-// flight against that host at once -- which is TemplateThreads multiplied by a
-// template's own payload parallelism, not TemplateThreads alone. 500 is the
-// value this used before the per-host client pool was introduced.
-const defaultMaxIdleConnsPerHost = 500
+// defaultTemplateThreads mirrors the -c default, for callers that build
+// types.Options by hand (library and SDK use) and leave TemplateThreads unset.
+const defaultTemplateThreads = 25
+
+// idleConnPoolSize returns the per-host idle connection pool size for a client.
+//
+// The pool has to be at least as large as the number of requests that can be in
+// flight against one host through this client at once. http.Transport closes a
+// connection returned to a host whose idle pool is already full, so an idle
+// pool smaller than the effective concurrency silently defeats keep-alive:
+// every request past the pool size pays a fresh TCP (and TLS) handshake instead
+// of reusing a pooled connection.
+//
+// templateThreads (-c) bounds how many templates execute at once.
+// requestThreads is one template's own payload parallelism, which
+// executeParallelHTTP runs as that many concurrent workers. Clients are cached
+// per (Configuration, host) and Configuration.Threads is part of that hash, so
+// every template that declares the same payload thread count shares a single
+// client -- and up to templateThreads of them run at the same time. The
+// requests this client can have in flight are therefore the product of the two,
+// not the larger of them.
+//
+// Sizing the cap at that demand never over-allocates: the pool is a ceiling on
+// retained connections, the transport only ever holds connections it actually
+// opened, and it reaps them after IdleConnTimeout.
+func idleConnPoolSize(templateThreads, requestThreads int) int {
+	if templateThreads <= 0 {
+		templateThreads = defaultTemplateThreads
+	}
+	if requestThreads <= 0 {
+		return templateThreads
+	}
+	return templateThreads * requestThreads
+}
 
 // Get creates or gets a client for the protocol based on custom configuration.
 // The host parameter scopes the client to a specific target, enabling per-host
@@ -329,23 +357,9 @@ func wrappedGet(options *types.Options, configuration *Configuration, host strin
 		retryableHttpOptions.Timeout = configuration.ResponseHeaderTimeout
 	}
 
-	// The idle pool has to be at least as large as the number of requests that
-	// can be in flight against this host at once. http.Transport closes a
-	// returned connection when the per-host idle pool is already full, so an
-	// idle pool smaller than the effective concurrency silently defeats
-	// keep-alive: every request past the pool size pays a fresh TCP (and TLS)
-	// handshake instead of reusing a pooled connection.
-	//
-	// A template's own thread count only ever raises this floor; it must not
-	// lower it, because concurrency against the host is TemplateThreads times
-	// the per-template payload parallelism, not a single template's threads.
-	maxIdleConns := defaultMaxIdleConnsPerHost
-	maxIdleConnsPerHost := defaultMaxIdleConnsPerHost
+	maxIdleConnsPerHost := idleConnPoolSize(options.TemplateThreads, configuration.Threads)
+	maxIdleConns := maxIdleConnsPerHost
 	maxConnsPerHost := 0 // unlimited by default; the SPM handler controls concurrency
-	if configuration.Threads > maxIdleConnsPerHost {
-		maxIdleConnsPerHost = configuration.Threads
-		maxIdleConns = configuration.Threads
-	}
 
 	disableKeepAlives := configuration.Connection != nil && configuration.Connection.DisableKeepAlive
 
