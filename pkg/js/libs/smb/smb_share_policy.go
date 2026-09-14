@@ -107,9 +107,10 @@ func applySharePolicy(ctx context.Context, executionId string, host string, port
 // has to stringify as "[]"; a nil slice reaches the DSL as "null", which is not
 // "[]" and would fire the very finding being suppressed.
 func evaluateSharePolicy(policy shareEvidence, shares []string, probes shareProbes) []string {
-	// IPC$, ADMIN$, C$..Z$ and print$ are published by every server and prove
-	// nothing. Without a real share there is no evidence to probe.
-	candidates := smbsession.NonAdministrativeShares(shares)
+	// IPC$, ADMIN$, C$..Z$ and print$ are published by every server, and the
+	// print queues beside them by every MFP. Neither proves anything, so
+	// without a share that could hold data there is nothing to probe.
+	candidates := smbsession.CandidateDataShares(shares)
 	if len(candidates) == 0 {
 		return []string{}
 	}

@@ -49,14 +49,45 @@ func IsAdministrativeShare(name string) bool {
 	return false
 }
 
-// NonAdministrativeShares returns the entries of shares that are not
-// administrative, preserving order. The result is what a caller may treat as
-// candidate evidence; whether any of it is actually reachable is a separate
-// question answered by ReachableShares.
-func NonAdministrativeShares(shares []string) []string {
+// IsPrinterSpoolerShare reports whether name is one of the queue and driver
+// shares a network printer or MFP publishes.
+//
+// Separate from IsAdministrativeShare because these are not on every server --
+// they are on every PRINTER -- but they answer the same question: mounting one
+// proves no data is exposed. A guest that can reach `print` or `lp1` can submit
+// a job, which is what the device is for.
+//
+// The names come from the shipped corpus rather than from a vendor list: across
+// the production evidence, `[IPC$ direct hold print]` and `[IPC$ lp1 lp2 lp3
+// lp4]` alone account for 14 findings on Xerox and Ricoh MFPs.
+//
+// FILE_SHARE is deliberately NOT here even though it appears beside these on
+// the same devices: it is the scan-to-share, and scanned documents are exactly
+// the customer data this check exists to find.
+func IsPrinterSpoolerShare(name string) bool {
+	trimmed := strings.ToUpper(strings.TrimSpace(name))
+	switch trimmed {
+	case "PRINT", "DIRECT", "HOLD", "SEQUENTIAL",
+		"DRIVER_INST$", "PS3_DRIVER", "UNIV_DRIVER", "XPS_DRIVER":
+		return true
+	}
+	// Line printer ports: LP1 through LP9.
+	if len(trimmed) == 3 && strings.HasPrefix(trimmed, "LP") && trimmed[2] >= '1' && trimmed[2] <= '9' {
+		return true
+	}
+	return false
+}
+
+// CandidateDataShares returns the entries of shares that could plausibly hold
+// customer data -- everything that is neither administrative nor printer
+// plumbing -- preserving order.
+//
+// The result is what a caller may treat as candidate evidence; whether any of
+// it is actually reachable is a separate question answered by ReachableShares.
+func CandidateDataShares(shares []string) []string {
 	out := make([]string, 0, len(shares))
 	for _, share := range shares {
-		if strings.TrimSpace(share) == "" || IsAdministrativeShare(share) {
+		if strings.TrimSpace(share) == "" || IsAdministrativeShare(share) || IsPrinterSpoolerShare(share) {
 			continue
 		}
 		out = append(out, share)

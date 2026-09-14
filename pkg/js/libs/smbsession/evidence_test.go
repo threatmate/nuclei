@@ -25,16 +25,64 @@ func TestIsAdministrativeShare(t *testing.T) {
 	}
 }
 
-func TestNonAdministrativeSharesDropsNoiseAndKeepsOrder(t *testing.T) {
-	got := NonAdministrativeShares([]string{"IPC$", "Backups", "ADMIN$", "", "C$", "Media", "print$"})
+func TestIsPrinterSpoolerShare(t *testing.T) {
+	spooler := []string{"print", "PRINT", "direct", "hold", "sequential",
+		"lp1", "LP4", "lp9", "DRIVER_INST$", "PS3_Driver", "PS3_driver", "UNIV_Driver", "XPS_DRIVER"}
+	for _, name := range spooler {
+		require.True(t, IsPrinterSpoolerShare(name), "%q should be printer plumbing", name)
+	}
+
+	// FILE_SHARE is the scan-to-share on these same devices and holds scanned
+	// documents, which is the customer data the check exists to find. LP0 and
+	// LP10 are not real line-printer ports.
+	notSpooler := []string{"FILE_SHARE", "Scans", "printer-logs", "lp0", "lp10", "printing", "print$"}
+	for _, name := range notSpooler {
+		require.False(t, IsPrinterSpoolerShare(name), "%q should not be printer plumbing", name)
+	}
+}
+
+func TestCandidateDataSharesDropsNoiseAndKeepsOrder(t *testing.T) {
+	got := CandidateDataShares([]string{"IPC$", "Backups", "ADMIN$", "", "C$", "Media", "print$"})
 	require.Equal(t, []string{"Backups", "Media"}, got)
 }
 
 // A Samba box that enumerates only its administrative shares is the case the
 // old check could never clear: IPC$ is the pipe the enumeration travelled over,
 // so deleting the last real share left the finding standing.
-func TestNonAdministrativeSharesEmptyForAdminOnlyServer(t *testing.T) {
-	require.Empty(t, NonAdministrativeShares([]string{"IPC$", "ADMIN$", "C$"}))
+func TestCandidateDataSharesEmptyForAdminOnlyServer(t *testing.T) {
+	require.Empty(t, CandidateDataShares([]string{"IPC$", "ADMIN$", "C$"}))
+}
+
+// Real share lists from production, verbatim. The MFP rows are the 17 findings
+// the printer-plumbing rule adds; the scan-to-share row must survive it, and
+// the Datto row is the appliance that started all of this -- its shares are
+// real, so only the tree connect can clear it.
+func TestCandidateDataSharesAgainstProductionEvidence(t *testing.T) {
+	cases := []struct {
+		name   string
+		shares []string
+		want   []string
+	}{
+		{"xerox mfp queues", []string{"IPC$", "direct", "hold", "print"}, nil},
+		{"line printer ports", []string{"IPC$", "lp1", "lp2", "lp3", "lp4"}, nil},
+		{"mfp driver shares", []string{"IPC$", "UNIV_Driver", "PS3_Driver", "DRIVER_INST$", "print"}, nil},
+		{"windows admin shares only", []string{"ADMIN$", "C$", "IPC$"}, nil},
+		{"scan-to-share survives", []string{"DRIVER_INST$", "FILE_SHARE", "IPC$", "PS3_Driver", "UNIV_Driver", "print"}, []string{"FILE_SHARE"}},
+		{"datto appliance", []string{"samba", "baremetals", "windows_agents", "virtual_failover", "hyperv_instant_recovery", "read_only", "IPC$"},
+			[]string{"samba", "baremetals", "windows_agents", "virtual_failover", "hyperv_instant_recovery", "read_only"}},
+		{"windows server with a data share", []string{"ADMIN$", "C$", "IPC$", "Users"}, []string{"Users"}},
+		{"qnap nas", []string{"IPC$", "Multimedia", "Public", "Web"}, []string{"Multimedia", "Public", "Web"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := CandidateDataShares(tc.shares)
+			if tc.want == nil {
+				require.Empty(t, got)
+				return
+			}
+			require.Equal(t, tc.want, got)
+		})
+	}
 }
 
 // reachabilityBackend mounts only the shares in allowed, and lists only those
