@@ -163,7 +163,14 @@ func (c *SMBClient) ListSMBv2Metadata(ctx context.Context, host string, port int
 // ```
 func (c *SMBClient) ListShares(ctx context.Context, host string, port int, user, password string) ([]string, error) {
 	executionId := ctx.Value("executionId").(string)
-	return memoizedlistShares(ctx, executionId, host, port, user, password)
+	shares, err := memoizedlistShares(ctx, executionId, host, port, user, password)
+	if err != nil {
+		return nil, err
+	}
+	// The enumeration itself is unchanged and stays memoized on its own key;
+	// what varies is how much of it the calling template has earned. See
+	// smb_share_policy.go.
+	return applySharePolicy(ctx, executionId, host, port, user, password, shares), nil
 }
 
 // ListDir lists files and directories under path on the given share

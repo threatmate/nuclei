@@ -168,6 +168,7 @@ func (request *Request) Compile(options *protocols.ExecutorOptions) error {
 
 		opts := &compiler.ExecuteOptions{
 			ExecutionId:     request.options.Options.ExecutionId,
+			TemplateId:      request.options.TemplateID,
 			TimeoutVariants: request.options.Options.GetTimeouts(),
 			Source:          &request.Init,
 		}
@@ -404,6 +405,7 @@ func (request *Request) executeWithResults(port string, target *contextargs.Cont
 		result, err := request.options.JsCompiler.ExecuteWithOptions(target.Context(), request.preConditionCompiled, argsCopy,
 			&compiler.ExecuteOptions{
 				ExecutionId:     requestOptions.Options.ExecutionId,
+				TemplateId:      requestOptions.TemplateID,
 				TimeoutVariants: requestOptions.Options.GetTimeouts(),
 				Source:          &request.PreCondition,
 			},
@@ -641,6 +643,7 @@ func (request *Request) executeRequestWithPayloads(
 	results, err := request.options.JsCompiler.ExecuteWithOptions(input.Context(), request.scriptCompiled, argsCopy,
 		&compiler.ExecuteOptions{
 			ExecutionId:     requestOptions.Options.ExecutionId,
+			TemplateId:      requestOptions.TemplateID,
 			TimeoutVariants: requestOptions.Options.GetTimeouts(),
 			Source:          &request.Code,
 		},

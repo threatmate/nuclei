@@ -33,6 +33,14 @@ type ExecuteOptions struct {
 	// ExecutionId is the id of the execution
 	ExecutionId string
 
+	// TemplateId is the id of the template being executed. Exposed to js
+	// libraries through the run context so a library can apply a policy that
+	// depends on the claim the calling template makes -- see
+	// pkg/js/libs/smb sharePolicyFor, where "these credentials work" and
+	// "these share names are enumerable" need different evidence from one
+	// ListShares call. Empty when the caller did not set it.
+	TemplateId string
+
 	// Callback can be used to register new runtime helper functions
 	// ex: export etc
 	Callback func(runtime *goja.Runtime) error

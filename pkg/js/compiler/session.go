@@ -138,6 +138,7 @@ func (s *session) prepareCommon() {
 	}
 
 	s.config.runtime.SetContextValue("executionId", s.config.opts.ExecutionId)
+	s.config.runtime.SetContextValue("templateId", s.config.opts.TemplateId)
 	s.config.runtime.SetContextValue("ctx", s.config.ctx)
 	enableRequire(s.config.runtime)
 }
@@ -206,6 +207,7 @@ func (s *session) cleanupCommon() {
 		s.config.opts.Cleanup(s.config.runtime)
 	}
 	s.config.runtime.RemoveContextValue("executionId")
+	s.config.runtime.RemoveContextValue("templateId")
 	s.config.runtime.RemoveContextValue("ctx")
 }
 
