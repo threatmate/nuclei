@@ -2,7 +2,6 @@ package smb
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"testing"
 
@@ -58,29 +57,23 @@ func TestSharePolicyForCoversTheThreeTemplates(t *testing.T) {
 // credential was ever checked.
 func TestDefaultLoginSuppressedOnGuestMappingServer(t *testing.T) {
 	policy, _ := sharePolicyFor(templateSMBDefaultLogin)
-	got := evaluateSharePolicy(policy, applianceShares, guestServer())
-	requireSuppressed(t, got)
+	require.ErrorIs(t, evaluateSharePolicy(policy, applianceShares, guestServer()), ErrNoShareEvidence)
 }
 
 func TestAnonymousAccessSuppressedWhenNothingIsReachable(t *testing.T) {
 	policy, _ := sharePolicyFor(templateSMBAnonymousAccess)
-	got := evaluateSharePolicy(policy, applianceShares, guestServer())
-	requireSuppressed(t, got)
+	require.ErrorIs(t, evaluateSharePolicy(policy, applianceShares, guestServer()), ErrNoShareEvidence)
 }
 
-// A genuinely default-credentialed NAS is still a finding, and the response it
-// matches on is the unmodified enumeration -- IPC$ included, because the
-// templates' own extractors report that list.
+// A genuinely default-credentialed NAS is still a finding.
 func TestDefaultLoginStillFiresOnARealFinding(t *testing.T) {
 	policy, _ := sharePolicyFor(templateSMBDefaultLogin)
-	got := evaluateSharePolicy(policy, applianceShares, realFinding())
-	require.Equal(t, applianceShares, got)
+	require.NoError(t, evaluateSharePolicy(policy, applianceShares, realFinding()))
 }
 
 func TestAnonymousAccessStillFiresWhenAShareIsReachable(t *testing.T) {
 	policy, _ := sharePolicyFor(templateSMBAnonymousAccess)
-	got := evaluateSharePolicy(policy, applianceShares, realFinding())
-	require.Equal(t, applianceShares, got)
+	require.NoError(t, evaluateSharePolicy(policy, applianceShares, realFinding()))
 }
 
 // Even when the credential is validated, share NAMES are not access. A server
@@ -100,7 +93,7 @@ func TestAdministrativeOnlyEnumerationIsNotEvidence(t *testing.T) {
 					return nil
 				},
 			}
-			requireSuppressed(t, evaluateSharePolicy(policy, []string{"IPC$", "ADMIN$", "C$"}, probes))
+			require.ErrorIs(t, evaluateSharePolicy(policy, []string{"IPC$", "ADMIN$", "C$"}, probes), ErrNoShareEvidence)
 		})
 	}
 }
@@ -113,10 +106,10 @@ func TestUnmeasurableCanaryDoesNotSuppress(t *testing.T) {
 	probes.acceptsAnyCredential = func() (bool, error) {
 		return false, errors.New("dial tcp: i/o timeout")
 	}
-	require.Equal(t, applianceShares, evaluateSharePolicy(policy, applianceShares, probes))
+	require.NoError(t, evaluateSharePolicy(policy, applianceShares, probes))
 
 	probes.reachableShares = func([]string) []string { return nil }
-	requireSuppressed(t, evaluateSharePolicy(policy, applianceShares, probes))
+	require.ErrorIs(t, evaluateSharePolicy(policy, applianceShares, probes), ErrNoShareEvidence)
 }
 
 // smb-anonymous-access never asks the canary: the credential it offers is
@@ -129,21 +122,19 @@ func TestAnonymousAccessNeverDialsTheCanary(t *testing.T) {
 		t.Fatal("canary dialed for a claim that does not rest on a credential")
 		return false, nil
 	}
-	require.Equal(t, applianceShares, evaluateSharePolicy(policy, applianceShares, probes))
+	require.NoError(t, evaluateSharePolicy(policy, applianceShares, probes))
 }
 
 func TestApplySharePolicyLeavesUnpolicedTemplatesAlone(t *testing.T) {
 	// No templateId at all (direct Go callers, dcerpc, tests).
-	require.Equal(t, applianceShares,
-		applySharePolicy(context.Background(), "exec", "10.0.0.5", 445, "u", "p", applianceShares))
+	require.NoError(t, applySharePolicy(context.Background(), "exec", "10.0.0.5", 445, "u", "p", applianceShares))
 
 	// smb-shares, and an arbitrary other template, keep the raw enumeration
 	// even where nothing is reachable -- reaching a probe would dial, and these
 	// assertions would hang or fail if the policy tried.
 	for _, id := range []string{"smb-shares", "smb-enum-domains"} {
 		ctx := context.WithValue(context.Background(), "templateId", id) //nolint:staticcheck // SA1029: matches the existing executionId key
-		require.Equal(t, applianceShares,
-			applySharePolicy(ctx, "exec", "10.0.0.5", 445, "u", "p", applianceShares))
+		require.NoError(t, applySharePolicy(ctx, "exec", "10.0.0.5", 445, "u", "p", applianceShares))
 	}
 }
 
@@ -159,15 +150,21 @@ func TestTemplateIDFromContext(t *testing.T) {
 	require.Equal(t, "", templateIDFromContext(ctx))
 }
 
-// requireSuppressed asserts the empty-not-nil contract. The templates match on
-// `response != "[]"` and `contains(response, "IPC$")`; a nil slice reaches the
-// DSL as "null", which is not "[]", and would fire the finding being suppressed.
-func requireSuppressed(t *testing.T, got []string) {
-	t.Helper()
-	require.NotNil(t, got, "suppressed result must be an empty slice, never nil")
-	require.Empty(t, got)
-
-	encoded, err := json.Marshal(got)
-	require.NoError(t, err)
-	require.Equal(t, "[]", string(encoded), `suppressed result must render as "[]" for the dsl matcher`)
+// This is the test that an earlier version of this file got wrong, and it cost
+// a whole end-to-end run to find out. Suppression was expressed as an empty,
+// non-nil slice on the theory that it would reach the dsl as "[]" and fail
+// `response != "[]"`. It does not. The javascript protocol sets `response` to
+// results.Export() -- a Go []string, compared against a STRING literal, which
+// is unequal for every slice -- and `success` to results.ToBoolean(), which is
+// true for any JS array including an empty one. A verified run against a
+// guest-mapping Samba server produced response='[]' and matched anyway, nine
+// times.
+//
+// So the contract is: suppression is an ERROR, never a value. Anything that
+// turns it back into a returned slice silently restores the false positive.
+func TestSuppressionIsAnErrorNotAnEmptyList(t *testing.T) {
+	policy, _ := sharePolicyFor(templateSMBDefaultLogin)
+	err := evaluateSharePolicy(policy, applianceShares, guestServer())
+	require.Error(t, err, "suppression must be an error; a returned slice cannot fail `success == true`")
+	require.ErrorIs(t, err, ErrNoShareEvidence)
 }

@@ -13,6 +13,24 @@ import (
 // entry of the wrong type.
 var errCachedResultType = errors.New("could not convert cached result")
 
+// ErrNoShareEvidence is what a policed template gets instead of a share list
+// when nothing was demonstrated.
+//
+// It has to be an ERROR rather than an empty list, and that is not a style
+// choice -- it is the only thing these matchers can see. The javascript
+// protocol sets `response` to results.Export(), a Go []string, and `success` to
+// results.ToBoolean(). So:
+//
+//   - `response != "[]"` compares a Go SLICE against the string "[]" and is
+//     therefore true for every slice, empty or not. It never discriminated.
+//   - `success` is the goja truthiness of the returned value, and a JS array is
+//     truthy even when empty.
+//
+// Returning []string{} therefore suppresses nothing: the script still succeeds
+// and the finding still fires. Returning an error makes the script throw, which
+// is the one signal every one of these matchers gates on with `success == true`.
+var ErrNoShareEvidence = errors.New("smb: share enumeration demonstrated no access (server authenticates any credential, or no reachable data share)")
+
 // Template ids whose claim needs more than a share enumeration to stand up.
 const (
 	templateSMBDefaultLogin    = "smb-default-login"
@@ -83,12 +101,12 @@ type shareProbes struct {
 	reachableShares func(candidates []string) []string
 }
 
-// applySharePolicy returns the share list the calling template is entitled to
-// match on.
-func applySharePolicy(ctx context.Context, executionId string, host string, port int, user, password string, shares []string) []string {
+// applySharePolicy reports whether the calling template's claim is backed by
+// evidence, returning ErrNoShareEvidence when it is not.
+func applySharePolicy(ctx context.Context, executionId string, host string, port int, user, password string, shares []string) error {
 	policy, ok := sharePolicyFor(templateIDFromContext(ctx))
 	if !ok {
-		return shares
+		return nil
 	}
 	return evaluateSharePolicy(policy, shares, shareProbes{
 		acceptsAnyCredential: func() (bool, error) {
@@ -100,19 +118,14 @@ func applySharePolicy(ctx context.Context, executionId string, host string, port
 	})
 }
 
-// evaluateSharePolicy decides how much of shares survives policy.
-//
-// An unentitled caller gets an EMPTY, NON-NIL slice. The templates match with
-// `response != "[]"` and `contains(response, "IPC$")`, so a suppressed result
-// has to stringify as "[]"; a nil slice reaches the DSL as "null", which is not
-// "[]" and would fire the very finding being suppressed.
-func evaluateSharePolicy(policy shareEvidence, shares []string, probes shareProbes) []string {
+// evaluateSharePolicy decides whether shares supports the claim policy guards.
+func evaluateSharePolicy(policy shareEvidence, shares []string, probes shareProbes) error {
 	// IPC$, ADMIN$, C$..Z$ and print$ are published by every server, and the
 	// print queues beside them by every MFP. Neither proves anything, so
 	// without a share that could hold data there is nothing to probe.
 	candidates := smbsession.CandidateDataShares(shares)
 	if len(candidates) == 0 {
-		return []string{}
+		return ErrNoShareEvidence
 	}
 
 	if policy.requireValidatedCredential {
@@ -121,15 +134,15 @@ func evaluateSharePolicy(policy shareEvidence, shares []string, probes shareProb
 		// dropping it on a failed measurement.
 		acceptsAnything, err := probes.acceptsAnyCredential()
 		if err == nil && acceptsAnything {
-			return []string{}
+			return ErrNoShareEvidence
 		}
 	}
 
 	if policy.requireReachableShare && len(probes.reachableShares(candidates)) == 0 {
-		return []string{}
+		return ErrNoShareEvidence
 	}
 
-	return shares
+	return nil
 }
 
 // memoizedAcceptsAnyCredential runs one canary login per host per execution.

@@ -168,9 +168,14 @@ func (c *SMBClient) ListShares(ctx context.Context, host string, port int, user,
 		return nil, err
 	}
 	// The enumeration itself is unchanged and stays memoized on its own key;
-	// what varies is how much of it the calling template has earned. See
-	// smb_share_policy.go.
-	return applySharePolicy(ctx, executionId, host, port, user, password, shares), nil
+	// what varies is whether the calling template has earned the right to match
+	// on it. A template whose claim is not supported gets ErrNoShareEvidence,
+	// which surfaces to the script as a throw -- see smb_share_policy.go for
+	// why an empty list cannot do this job.
+	if err := applySharePolicy(ctx, executionId, host, port, user, password, shares); err != nil {
+		return nil, err
+	}
+	return shares, nil
 }
 
 // ListDir lists files and directories under path on the given share
