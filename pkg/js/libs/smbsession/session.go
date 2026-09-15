@@ -6,7 +6,6 @@ import (
 	"io"
 	"os"
 	"path"
-	"strings"
 	"time"
 
 	gpsession "github.com/Mzack9999/goimpacket/pkg/session"
@@ -75,13 +74,7 @@ func Dial(ctx context.Context, executionID, host string, port int, creds Creds) 
 	if port <= 0 {
 		port = 445
 	}
-	domain, user := ParseIdentity(creds.User)
-	if creds.Domain != "" {
-		domain = creds.Domain
-	}
-	if user == "" {
-		user = strings.TrimSpace(creds.User)
-	}
+	domain, user := resolveIdentity(creds)
 
 	gpCreds := &gpsession.Credentials{
 		Domain:   domain,
