@@ -24,6 +24,45 @@ func ParseIdentity(user string) (domain, username string) {
 	return "", user
 }
 
+// GuestUser is the username Dial sends when the caller offers none.
+//
+// An SMB null (anonymous) session is not something this client can open:
+// goimpacket refuses an empty NTLM username before a packet leaves the host,
+// with "Anonymous account is not supported yet. Use guest account instead".
+// That refusal is unconditional and client-side, so an empty username is a
+// guaranteed failure against every server rather than a check that sometimes
+// works.
+//
+// A template that means "no credential" therefore has to spell it as
+// something, and upstream's smb-anonymous-access spells it " " -- a single
+// space, which ParseIdentity trims away to nothing. Taking the library's own
+// advice and dialing guest is what lets that check run at all.
+//
+// Guest is not a second-best stand-in for anonymous here, it is the same
+// claim: the finding is that an unauthenticated party reaches the share, and a
+// guest session is how servers grant exactly that. What a guest session does
+// NOT establish is that any credential was validated -- so the caller still
+// owes evidence beyond "the session opened", which is what the share policy in
+// pkg/js/libs/smb requires before a finding stands.
+const GuestUser = "guest"
+
+// resolveIdentity turns Creds into the domain and username to put on the wire.
+//
+// A username that parses to nothing becomes GuestUser. That covers the empty
+// string, whitespace, and a bare domain with no account after it ("CORP\\"),
+// all of which previously reached goimpacket as either an empty username it
+// refuses outright or a separator-laden string no server has an account for.
+func resolveIdentity(creds Creds) (domain, user string) {
+	domain, user = ParseIdentity(creds.User)
+	if creds.Domain != "" {
+		domain = creds.Domain
+	}
+	if user == "" {
+		user = GuestUser
+	}
+	return domain, user
+}
+
 // NormalizeSharePath converts an SMB share-relative path to a clean form
 // (forward slashes, no leading slash, "." for share root). Rejects ".." escapes.
 func NormalizeSharePath(p string) (string, error) {
