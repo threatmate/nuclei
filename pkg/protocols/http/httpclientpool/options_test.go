@@ -1,8 +1,10 @@
 package httpclientpool
 
 import (
+	"bufio"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"sync/atomic"
@@ -126,4 +128,49 @@ func TestSendRawRequestFollowsRedirectsAsRawhttpDoes(t *testing.T) {
 			require.True(t, options.FollowRedirects == tc.follow, "SendRawRequest must not change the caller's options")
 		})
 	}
+}
+
+// TestSendRawRequestNamesTheHopThatReset covers the stand-in 400 for a reset connection when the
+// reset came from a hop a redirect led to: it must name that hop, not the URL first asked.
+func TestSendRawRequestNamesTheHopThatReset(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = listener.Close() })
+	go func() {
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			// Read the request's headers, then reset rather than answer.
+			reader := bufio.NewReader(conn)
+			for {
+				line, err := reader.ReadString('\n')
+				if err != nil || line == "\r\n" {
+					break
+				}
+			}
+			_ = conn.(*net.TCPConn).SetLinger(0)
+			_ = conn.Close()
+		}
+	}()
+	resetURL := "http://" + listener.Addr().String()
+
+	redirector := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Location", resetURL+"/x")
+		w.WriteHeader(http.StatusFound)
+	}))
+	t.Cleanup(redirector.Close)
+
+	clientOptions := *rawhttp.DefaultOptions
+	client := rawhttp.NewClient(&clientOptions)
+	t.Cleanup(client.Close)
+	options := clientOptions
+	options.FollowRedirects = true
+
+	resp, landed, err := SendRawRequest(client, &RawHttpRequestOpts{Method: http.MethodGet, URL: redirector.URL, Path: "/", Options: &options})
+	require.NoError(t, err)
+	require.Equal(t, http.StatusBadRequest, resp.StatusCode, "a reset is answered with the stand-in 400")
+	require.Equal(t, resetURL+"/x", landed)
+	require.Equal(t, listener.Addr().String(), resp.Request.URL.Host, "the stand-in response must name the hop that reset")
 }
