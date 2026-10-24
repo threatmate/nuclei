@@ -764,6 +764,9 @@ func (request *Request) executeRequest(input *contextargs.Context, generatedRequ
 	}
 
 	var formedURL string
+	// rawRedirected marks an unsafe request whose answer came from a redirect rawhttp followed,
+	// so formedURL names the hop that answered and outranks the template's own FullURL.
+	var rawRedirected bool
 	var hostname string
 	timeStart := time.Now()
 	if generatedRequest.original.Pipeline {
@@ -802,16 +805,12 @@ func (request *Request) executeRequest(input *contextargs.Context, generatedRequ
 		if generatedRequest.rawRequest.FullURL != "" {
 			inputUrl = generatedRequest.rawRequest.FullURL
 		}
-		if url, err := urlutil.ParseURL(inputUrl, false); err == nil {
-			url.Path = ""
-			url.Params = urlutil.NewOrderedParams() // donot include query params
-			// inputUrl should only contain scheme://host:port
-			inputUrl = url.String()
-		}
+		inputUrl = rawRequestOrigin(inputUrl, false)
 		formedURL = fmt.Sprintf("%s%s", inputUrl, generatedRequest.rawRequest.Path)
 
 		// send rawhttp request and get response
-		resp, err = httpclientpool.SendRawRequest(generatedRequest.original.rawhttpClient, &httpclientpool.RawHttpRequestOpts{
+		var landedURL string
+		resp, landedURL, err = httpclientpool.SendRawRequest(generatedRequest.original.rawhttpClient, &httpclientpool.RawHttpRequestOpts{
 			Method:  generatedRequest.rawRequest.Method,
 			URL:     inputUrl,
 			Path:    generatedRequest.rawRequest.Path,
@@ -819,6 +818,15 @@ func (request *Request) executeRequest(input *contextargs.Context, generatedRequ
 			Body:    io.NopCloser(strings.NewReader(generatedRequest.rawRequest.Data)),
 			Options: &options,
 		})
+		// A followed redirect means the answer came from somewhere other than inputUrl, so
+		// matched-at must name that place: a consumer deciding whether the exchange is the
+		// target's own reads it from there. host and ip still name the target, which is what
+		// was asked to be scanned. The path stays the template's, because that is the request
+		// rawhttp sent to every hop.
+		if landedURL != "" {
+			formedURL = fmt.Sprintf("%s%s", rawRequestOrigin(landedURL, true), generatedRequest.rawRequest.Path)
+			rawRedirected = true
+		}
 	} else {
 		//** For Normal requests **//
 		// Use the dial target (URL.Host) rather than the optional Host-header
@@ -1055,7 +1063,7 @@ func (request *Request) executeRequest(input *contextargs.Context, generatedRequ
 		onceFunc()
 		matchedURL := input.MetaInput.Input
 		if generatedRequest.rawRequest != nil {
-			if generatedRequest.rawRequest.FullURL != "" {
+			if generatedRequest.rawRequest.FullURL != "" && !rawRedirected {
 				matchedURL = generatedRequest.rawRequest.FullURL
 			} else {
 				matchedURL = formedURL
@@ -1403,4 +1411,25 @@ func (request *Request) isUnresponsiveAddress(input *contextargs.Context) bool {
 		return request.options.HostErrorsCache.Check(request.options.ProtocolType.String(), input)
 	}
 	return false
+}
+
+// rawRequestOrigin is value cut down to scheme://host:port, which is what rawhttp is given as the
+// URL of an unsafe request: the path is sent separately, so a path or query left here would be
+// sent twice. A value that does not parse is returned as it stands.
+//
+// unsafe is how leniently to parse it. A redirect's Location is the scanned host's to write, and
+// rawhttp dials it after an unsafe parse, so a landed URL must be cut down with the same parse:
+// under the strict one an invalid escape in its path ("/%zz") fails the parse, the whole Location
+// comes back, and matched-at carries a value consumers cannot parse to find the host in.
+func rawRequestOrigin(value string, unsafe bool) string {
+	url, err := urlutil.ParseURL(value, unsafe)
+	if err != nil {
+		return value
+	}
+	url.Path = ""
+	url.Params = urlutil.NewOrderedParams() // donot include query params
+	// Nor a fragment: it is never sent, and String() writes it ahead of the path the caller
+	// appends ("http://host:port#frag/path"), which a Location can make unparseable ("#%zz").
+	url.Fragment = ""
+	return url.String()
 }
