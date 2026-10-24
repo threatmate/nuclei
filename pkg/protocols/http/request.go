@@ -1428,5 +1428,8 @@ func rawRequestOrigin(value string, unsafe bool) string {
 	}
 	url.Path = ""
 	url.Params = urlutil.NewOrderedParams() // donot include query params
+	// Nor a fragment: it is never sent, and String() writes it ahead of the path the caller
+	// appends ("http://host:port#frag/path"), which a Location can make unparseable ("#%zz").
+	url.Fragment = ""
 	return url.String()
 }
